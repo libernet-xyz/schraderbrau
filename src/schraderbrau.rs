@@ -17,8 +17,8 @@ use subtle::{
 
 /// The prime order of the Schraderbrau field stored as four 64-bit limbs in little endian order.
 pub const MODULUS: [u64; 4] = [
-    0x0000000000000001u64,
-    0xfffffffffffffff9u64,
+    0x4000000000000001u64,
+    0xfffffffffffffffeu64,
     0xffffffffffffffffu64,
     0x7fffffffffffffffu64,
 ];
@@ -33,10 +33,10 @@ static CHARACTERS_LOWER_CASE: &'static [u8] = b"0123456789abcdefghijklmnopqrstuv
 ///
 /// The prime order of the field is:
 ///
-///   p = 0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001
+///   p = 0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001
 ///
 /// This field is well-suited for use in binary FRI because it has a large 2-adicity: p-1 is
-/// divided by 2^64, supporting polynomials of extremely high degree. Unlike BlueSky, p-1 is not
+/// divided by 2^62, supporting polynomials of extremely high degree. Unlike BlueSky, p-1 is not
 /// divisible by 3, so this field does not support ternary FRI.
 ///
 /// All our scalars are stored in Montgomery form with the four limbs stored in little-endian order.
@@ -46,16 +46,16 @@ pub struct Scalar(u64, u64, u64, u64);
 impl Scalar {
     /// The raw (non-Montgomery) little-endian representation of `MAX`.
     const MAX_RAW: Self = Self(
-        0x0000000000000000u64,
-        0xfffffffffffffff9u64,
+        0x4000000000000000u64,
+        0xfffffffffffffffeu64,
         0xffffffffffffffffu64,
         0x7fffffffffffffffu64,
     );
 
     /// R in raw form, ie. the four limbs of `2^256 mod p` in little-endian order.
     const R: Self = Self(
-        0xfffffffffffffffeu64,
-        0x000000000000000du64,
+        0x7ffffffffffffffeu64,
+        0x0000000000000003u64,
         0x0000000000000000u64,
         0x0000000000000000u64,
     );
@@ -63,14 +63,14 @@ impl Scalar {
     /// R in Montgomery form, ie. R^2 mod p.
     const R2: Self = Self(
         0x0000000000000004u64,
-        0xffffffffffffffc8u64,
-        0x00000000000000c3u64,
+        0x3ffffffffffffff2u64,
+        0x000000000000000cu64,
         0x0000000000000000u64,
     );
 
     const P: [u64; 4] = MODULUS;
 
-    const P_INV: u64 = 0xffffffffffffffffu64;
+    const P_INV: u64 = 0x3fffffffffffffffu64;
 
     /// Subtracts p. Assumes no underflow, ie. `self` must be greater than or equal to p.
     ///
@@ -627,10 +627,10 @@ impl TryFrom<usize> for Scalar {
 
 impl Field for Scalar {
     const MODULUS: &'static str =
-        "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001";
+        "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001";
 
     const CHARACTERISTIC: &'static str =
-        "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001";
+        "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001";
 
     const LEN: usize = 32;
 
@@ -639,54 +639,54 @@ impl Field for Scalar {
     const ONE: Self = Self::R;
 
     const MAX: Self = Self(
-        0x0000000000000003u64,
-        0xffffffffffffffebu64,
+        0xc000000000000003u64,
+        0xfffffffffffffffau64,
         0xffffffffffffffffu64,
         0x7fffffffffffffffu64,
     );
 
-    const S: usize = 64;
+    const S: usize = 62;
 
     const MULTIPLICATIVE_GENERATOR: Self = Self(
-        0xfffffffffffffffau64,
-        0x0000000000000029u64,
+        0x7ffffffffffffffau64,
+        0x000000000000000au64,
         0x0000000000000000u64,
         0x0000000000000000u64,
     );
 
     const MINUS_TWO: Self = Self(
-        0x0000000000000005u64,
-        0xffffffffffffffddu64,
+        0x4000000000000005u64,
+        0xfffffffffffffff7u64,
         0xffffffffffffffffu64,
         0x7fffffffffffffffu64,
     );
 
     const TWO_INV: Self = Self(
-        0xffffffffffffffffu64,
-        0x0000000000000006u64,
+        0xbfffffffffffffffu64,
+        0x0000000000000001u64,
         0x0000000000000000u64,
         0x0000000000000000u64,
     );
 
     const ROOT_OF_UNITY: Self = Self(
-        0x1edc2a7f9c81631cu64,
-        0xce295f29138c3ae3u64,
-        0x47b815098dc7da00u64,
-        0x75414357491d9793u64,
+        0xe5bbac717a361622u64,
+        0xbbaab957e6cb3b09u64,
+        0x67a5fd5b5fbc8c0au64,
+        0x64759b85442c90c3u64,
     );
 
     const ROOT_OF_UNITY_INV: Self = Self(
-        0xf438ffea203c5a70u64,
-        0x339c83090c381d0au64,
-        0xe1e4ee8779392818u64,
-        0x1eb85ce8462d4f9eu64,
+        0x3a83f68af040bd72u64,
+        0x09af02daf8c40bd0u64,
+        0x531373437f331f83u64,
+        0x726b81ad9bfd1b6du64,
     );
 
     const DELTA: Self = Self(
-        0x396b60a50e9b0531u64,
-        0xefed3767bdfa3319u64,
-        0x360166f7f0371cf1u64,
-        0x04a7d727a21c2bd3u64,
+        0x7598ae74ce578f05u64,
+        0xba2bff2c34d61023u64,
+        0x7d1b8d181f880888u64,
+        0x2363bda763dd50c0u64,
     );
 
     fn is_odd(&self) -> Choice {
@@ -1049,11 +1049,11 @@ mod tests {
         );
         assert_eq!(
             format!("{}", Scalar::MAX - Scalar::ONE),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff"
         );
         assert_eq!(
             format!("{}", Scalar::MAX),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000"
         );
     }
 
@@ -1080,11 +1080,11 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", Scalar::MAX - Scalar::ONE),
-            "Scalar(0x7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff)"
+            "Scalar(0x7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff)"
         );
         assert_eq!(
             format!("{:?}", Scalar::MAX),
-            "Scalar(0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000)"
+            "Scalar(0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000)"
         );
     }
 
@@ -1323,11 +1323,11 @@ mod tests {
             parse_scalar("0x2f21673059ea54f8394a22713118b2b9e029b4c2b5545b4ae5dfaa10108443d6");
         assert_eq!(
             lhs + rhs,
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b")
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b")
         );
         assert_eq!(
             lhs + &rhs,
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b")
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b")
         );
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
         lhs += rhs;
         assert_eq!(
             lhs,
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b")
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b")
         );
     }
 
@@ -1379,7 +1379,7 @@ mod tests {
         lhs += &rhs;
         assert_eq!(
             lhs,
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b")
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b")
         );
     }
 
@@ -1393,7 +1393,7 @@ mod tests {
         assert_eq!(-Scalar::ONE, Scalar::MAX);
         assert_eq!(-from_const(2), Scalar::MAX - Scalar::ONE);
         test_neg_impl(parse_scalar(
-            "0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b",
+            "0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b",
         ));
         test_neg_impl(parse_scalar(
             "0x2f21673059ea54f8394a22713118b2b9e029b4c2b5545b4ae5dfaa10108443d6",
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn test_sub_wraparound() {
         let lhs =
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b");
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b");
         let rhs =
             parse_scalar("0x2f21673059ea54f8394a22713118b2b9e029b4c2b5545b4ae5dfaa10108443d6");
         assert_eq!(
@@ -1464,7 +1464,7 @@ mod tests {
     #[test]
     fn test_sub_assign_wraparound() {
         let mut lhs =
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b");
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b");
         let rhs =
             parse_scalar("0x2f21673059ea54f8394a22713118b2b9e029b4c2b5545b4ae5dfaa10108443d6");
         lhs -= rhs;
@@ -1477,7 +1477,7 @@ mod tests {
     #[test]
     fn test_sub_assign_wraparound_ref() {
         let mut lhs =
-            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d71c2862b72bc606760b");
+            parse_scalar("0x03674752fdab8efaa80c59f2a14e26da0837d69504a7d716e862b72bc606760b");
         let rhs =
             parse_scalar("0x2f21673059ea54f8394a22713118b2b9e029b4c2b5545b4ae5dfaa10108443d6");
         lhs -= &rhs;
@@ -1535,12 +1535,12 @@ mod tests {
         test_mul_large_impl(
             parse_scalar("0x1be5c79927a7c7c2c1057e99b51e26efc2bac5029c6322e20405fc9334c50a9f"),
             parse_scalar("0x395ff9efcaa35d618872a95b7244c4b3b2a7e1d9276d4e88db27217993014628"),
-            parse_scalar("0x23f1b099da0d6620b8b4ca854d807638667f724e345e763ed44eece81fdd2003"),
+            parse_scalar("0x49d715df21e33dd941b73c0cf0c548b29db0ac17d142621d579bf6d2e46f90bc"),
         );
         test_mul_large_impl(
             parse_scalar("0x233f7c593e331b2e1285f17013cd4b692d7219c10bf06adca229780913851577"),
             parse_scalar("0x4433ff6315d939cda16f055756432036cab445af8186bc60b243127905b84c73"),
-            parse_scalar("0x4cdb018350c3c2be2d7bd2080acb620e75623c6b0c062d53f6c3c94c7d5f87e0"),
+            parse_scalar("0x9c067acc5750877bb19fea85a6c3088c3bb0b10cb0eb34d3bf843f7038de993"),
         );
     }
 
@@ -2038,15 +2038,15 @@ mod tests {
         assert_eq!(Scalar::from_str_radix("10", 2).unwrap(), from_const(2));
         assert_eq!(Scalar::from_str_radix("11", 2).unwrap(), from_const(3));
         assert_eq!(
-            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110001111111111111111111111111111111111111111111111111111111111111111", 2).unwrap(),
+            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100011111111111111111111111111111111111111111111111111111111111111", 2).unwrap(),
             Scalar::MAX - Scalar::ONE
         );
         assert_eq!(
-            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110010000000000000000000000000000000000000000000000000000000000000000", 2).unwrap(),
+            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100100000000000000000000000000000000000000000000000000000000000000", 2).unwrap(),
             Scalar::MAX
         );
         assert!(
-            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110010000000000000000000000000000000000000000000000000000000000000001", 2).is_err(),
+            Scalar::from_str_radix("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100100000000000000000000000000000000000000000000000000000000000001", 2).is_err(),
         );
     }
 
@@ -2070,11 +2070,11 @@ mod tests {
         assert_eq!(from_const(3).to_str_radix(2, 3, false), "011");
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_str_radix(2, 0, false),
-            "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110001111111111111111111111111111111111111111111111111111111111111111"
+            "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100011111111111111111111111111111111111111111111111111111111111111"
         );
         assert_eq!(
             Scalar::MAX.to_str_radix(2, 0, false),
-            "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111110010000000000000000000000000000000000000000000000000000000000000000"
+            "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100100000000000000000000000000000000000000000000000000000000000000"
         );
     }
 
@@ -2096,15 +2096,15 @@ mod tests {
         assert_eq!(Scalar::from_str_radix("21", 8).unwrap(), from_const(17));
         assert_eq!(Scalar::from_str_radix("22", 8).unwrap(), from_const(18));
         assert_eq!(
-            Scalar::from_str_radix("7777777777777777777777777777777777777777777777777777777777777761777777777777777777777", 8).unwrap(),
+            Scalar::from_str_radix("7777777777777777777777777777777777777777777777777777777777777774377777777777777777777", 8).unwrap(),
             Scalar::MAX - Scalar::ONE
         );
         assert_eq!(
-            Scalar::from_str_radix("7777777777777777777777777777777777777777777777777777777777777762000000000000000000000", 8).unwrap(),
+            Scalar::from_str_radix("7777777777777777777777777777777777777777777777777777777777777774400000000000000000000", 8).unwrap(),
             Scalar::MAX
         );
         assert!(Scalar::from_str_radix(
-            "7777777777777777777777777777777777777777777777777777777777777762000000000000000000001",
+            "7777777777777777777777777777777777777777777777777777777777777774400000000000000000001",
             8
         )
         .is_err(),);
@@ -2146,11 +2146,11 @@ mod tests {
         assert_eq!(from_const(10).to_str_radix(8, 3, false), "012");
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_str_radix(8, 0, false),
-            "7777777777777777777777777777777777777777777777777777777777777761777777777777777777777"
+            "7777777777777777777777777777777777777777777777777777777777777774377777777777777777777"
         );
         assert_eq!(
             Scalar::MAX.to_str_radix(8, 0, false),
-            "7777777777777777777777777777777777777777777777777777777777777762000000000000000000000"
+            "7777777777777777777777777777777777777777777777777777777777777774400000000000000000000"
         );
     }
 
@@ -2170,7 +2170,7 @@ mod tests {
         assert_eq!(Scalar::from_str_radix("22", 10).unwrap(), from_const(22));
         assert_eq!(
             Scalar::from_str_radix(
-                "57896044618658097711785492504343953926634992332820282019599664795440597958655",
+                "57896044618658097711785492504343953926634992332820282019696510201827573104639",
                 10
             )
             .unwrap(),
@@ -2178,14 +2178,14 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_str_radix(
-                "57896044618658097711785492504343953926634992332820282019599664795440597958656",
+                "57896044618658097711785492504343953926634992332820282019696510201827573104640",
                 10
             )
             .unwrap(),
             Scalar::MAX
         );
         assert!(Scalar::from_str_radix(
-            "57896044618658097711785492504343953926634992332820282019599664795440597958657",
+            "57896044618658097711785492504343953926634992332820282019696510201827573104641",
             10
         )
         .is_err(),);
@@ -2219,11 +2219,11 @@ mod tests {
         assert_eq!(from_const(11).to_str_radix(10, 3, false), "011");
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_str_radix(10, 0, false),
-            "57896044618658097711785492504343953926634992332820282019599664795440597958655"
+            "57896044618658097711785492504343953926634992332820282019696510201827573104639"
         );
         assert_eq!(
             Scalar::MAX.to_str_radix(10, 0, false),
-            "57896044618658097711785492504343953926634992332820282019599664795440597958656"
+            "57896044618658097711785492504343953926634992332820282019696510201827573104640"
         );
     }
 
@@ -2256,7 +2256,7 @@ mod tests {
         assert_eq!(Scalar::from_str_radix("22", 16).unwrap(), from_const(34));
         assert_eq!(
             Scalar::from_str_radix(
-                "7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff",
+                "7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff",
                 16
             )
             .unwrap(),
@@ -2264,14 +2264,14 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_str_radix(
-                "7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000",
+                "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000",
                 16
             )
             .unwrap(),
             Scalar::MAX
         );
         assert!(Scalar::from_str_radix(
-            "7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001",
+            "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001",
             16
         )
         .is_err(),);
@@ -2323,11 +2323,11 @@ mod tests {
         assert_eq!(from_const(31).to_str_radix(16, 2, false), "1f");
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_str_radix(16, 0, false),
-            "7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff"
+            "7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff"
         );
         assert_eq!(
             Scalar::MAX.to_str_radix(16, 0, false),
-            "7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000"
+            "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000"
         );
     }
 
@@ -2360,7 +2360,7 @@ mod tests {
         assert_eq!(Scalar::from_str_radix("22", 16).unwrap(), from_const(34));
         assert_eq!(
             Scalar::from_str_radix(
-                "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF8FFFFFFFFFFFFFFFF",
+                "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE3FFFFFFFFFFFFFFF",
                 16
             )
             .unwrap(),
@@ -2368,14 +2368,14 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_str_radix(
-                "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF90000000000000000",
+                "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000000",
                 16
             )
             .unwrap(),
             Scalar::MAX
         );
         assert!(Scalar::from_str_radix(
-            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF90000000000000001",
+            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000001",
             16
         )
         .is_err(),);
@@ -2427,11 +2427,11 @@ mod tests {
         assert_eq!(from_const(31).to_str_radix(16, 2, true), "1F");
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_str_radix(16, 0, true),
-            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF8FFFFFFFFFFFFFFFF"
+            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE3FFFFFFFFFFFFFFF"
         );
         assert_eq!(
             Scalar::MAX.to_str_radix(16, 0, true),
-            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF90000000000000000"
+            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000000"
         );
     }
 
@@ -2510,7 +2510,7 @@ mod tests {
         assert_eq!(Scalar::from_u512_mod_n("2".parse().unwrap()), from_const(2));
         assert_eq!(
             Scalar::from_u512_mod_n(
-                "0x7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff"
+                "0x7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff"
                     .parse()
                     .unwrap()
             ),
@@ -2518,7 +2518,7 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_u512_mod_n(
-                "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000"
+                "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000"
                     .parse()
                     .unwrap()
             ),
@@ -2526,7 +2526,7 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_u512_mod_n(
-                "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001"
+                "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001"
                     .parse()
                     .unwrap()
             ),
@@ -2534,7 +2534,7 @@ mod tests {
         );
         assert_eq!(
             Scalar::from_u512_mod_n(
-                "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000002"
+                "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000002"
                     .parse()
                     .unwrap()
             ),
@@ -2615,13 +2615,13 @@ mod tests {
         assert_eq!(from_const(2).to_u256(), "2".parse().unwrap());
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_u256(),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff"
                 .parse()
                 .unwrap()
         );
         assert_eq!(
             Scalar::MAX.to_u256(),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000"
                 .parse()
                 .unwrap()
         );
@@ -2634,13 +2634,13 @@ mod tests {
         assert_eq!(from_const(2).to_u512(), "2".parse().unwrap());
         assert_eq!(
             (Scalar::MAX - Scalar::ONE).to_u512(),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff8ffffffffffffffff"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe3fffffffffffffff"
                 .parse()
                 .unwrap()
         );
         assert_eq!(
             Scalar::MAX.to_u512(),
-            "0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000000"
+            "0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000000"
                 .parse()
                 .unwrap()
         );
@@ -2650,7 +2650,7 @@ mod tests {
     fn test_multiplicative_generator() {
         assert_eq!(Scalar::MULTIPLICATIVE_GENERATOR, from_const(3));
         assert_eq!(
-            Scalar::MULTIPLICATIVE_GENERATOR.pow(Scalar::MAX / Scalar::from(1u128 << Scalar::S)),
+            Scalar::MULTIPLICATIVE_GENERATOR.pow(Scalar::MAX / from_const(1u64 << Scalar::S)),
             Scalar::ROOT_OF_UNITY
         );
     }
@@ -2679,7 +2679,7 @@ mod tests {
             );
         }
         assert_eq!(
-            Scalar::ROOT_OF_UNITY.pow(Scalar::from(1u128 << Scalar::S)),
+            Scalar::ROOT_OF_UNITY.pow(from_const(1u64 << Scalar::S)),
             Scalar::ONE
         );
     }
@@ -2696,7 +2696,7 @@ mod tests {
     fn test_delta() {
         assert_eq!(
             Scalar::DELTA,
-            Scalar::MULTIPLICATIVE_GENERATOR.pow(Scalar::from(1u128 << Scalar::S))
+            Scalar::MULTIPLICATIVE_GENERATOR.pow(from_const(1u64 << Scalar::S))
         );
     }
 

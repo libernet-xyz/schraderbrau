@@ -7,7 +7,7 @@
 ## Overview
 
 Schraderbrau is a ~255-bit prime field and its order is the prime
-`0x7ffffffffffffffffffffffffffffffffffffffffffffff90000000000000001`. We call this number `p`.
+`0x7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001`. We call this number `p`.
 
 `p` takes slightly less than 50% of the 256-bit range, leaving the MSB unset so that it can be used
 for arbitrary purposes.
@@ -17,11 +17,11 @@ for arbitrary purposes.
 `p-1`, the greatest integer that fits in a Schraderbrau scalar, is factorized as follows:
 
 $$
-2^{64} \cdot 13 \cdot 27241 \cdot 50177 \cdot 994249 \cdot 177649061886023094277927983212050631674349
+2^{62} \cdot 5 \cdot 439 \cdot 3137 \cdot 1823224381313104235024478771836379058994557702276099
 $$
 
-The 2-adicity of 64 has been chosen to warrant a very large FFT capacity and evaluation domain for
-zkSNARK proofs.
+The 2-adicity of 62 has been chosen to match BlueSky's, warranting a very large FFT capacity and
+evaluation domain for zkSNARK proofs while keeping `2^S` safely representable in a 64-bit word.
 
 ## S-box optimization
 
