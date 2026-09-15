@@ -2107,7 +2107,7 @@ mod tests {
             "7777777777777777777777777777777777777777777777777777777777777774400000000000000000001",
             8
         )
-        .is_err(),);
+        .is_err());
     }
 
     #[test]
@@ -2188,7 +2188,7 @@ mod tests {
             "57896044618658097711785492504343953926634992332820282019696510201827573104641",
             10
         )
-        .is_err(),);
+        .is_err());
     }
 
     #[test]
@@ -2274,7 +2274,7 @@ mod tests {
             "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001",
             16
         )
-        .is_err(),);
+        .is_err());
     }
 
     #[test]
@@ -2378,7 +2378,7 @@ mod tests {
             "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000001",
             16
         )
-        .is_err(),);
+        .is_err());
     }
 
     #[test]
