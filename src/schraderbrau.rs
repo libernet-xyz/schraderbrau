@@ -2,8 +2,8 @@ use anyhow::{self, Context};
 use getrandom;
 use primitive_types::{H512, U256, U512};
 use starkom_ff::{
-    helpers::{adc, add, mac, mul, sbb, sub},
     Field, Field256, PrimeField, PrimeField256,
+    helpers::{adc, add, mac, mul, sbb, sub},
 };
 use std::cmp::Ordering;
 use std::iter::{Product, Sum};
@@ -732,7 +732,7 @@ impl Field for Scalar {
         if self.is_zero().into() {
             None
         } else {
-            Some(self.pow(Scalar::MINUS_TWO))
+            Some(self.pow_vartime(Scalar::MINUS_TWO))
         }
     }
 
@@ -2184,11 +2184,13 @@ mod tests {
             .unwrap(),
             Scalar::MAX
         );
-        assert!(Scalar::from_str_radix(
-            "57896044618658097711785492504343953926634992332820282019696510201827573104641",
-            10
-        )
-        .is_err());
+        assert!(
+            Scalar::from_str_radix(
+                "57896044618658097711785492504343953926634992332820282019696510201827573104641",
+                10
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2270,11 +2272,13 @@ mod tests {
             .unwrap(),
             Scalar::MAX
         );
-        assert!(Scalar::from_str_radix(
-            "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001",
-            16
-        )
-        .is_err());
+        assert!(
+            Scalar::from_str_radix(
+                "7ffffffffffffffffffffffffffffffffffffffffffffffe4000000000000001",
+                16
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2374,11 +2378,13 @@ mod tests {
             .unwrap(),
             Scalar::MAX
         );
-        assert!(Scalar::from_str_radix(
-            "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000001",
-            16
-        )
-        .is_err());
+        assert!(
+            Scalar::from_str_radix(
+                "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE4000000000000001",
+                16
+            )
+            .is_err()
+        );
     }
 
     #[test]
