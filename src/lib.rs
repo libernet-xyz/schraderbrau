@@ -3,6 +3,14 @@
 
 #![doc = include_str!("../README.md")]
 
-mod schraderbrau;
+#[cfg(any(target_arch = "wasm32", test))]
+mod scalar29;
 
-pub use schraderbrau::*;
+#[cfg(any(not(target_arch = "wasm32"), test))]
+mod scalar64;
+
+#[cfg(target_arch = "wasm32")]
+pub use scalar29::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use scalar64::*;
