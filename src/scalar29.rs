@@ -1,10 +1,18 @@
+//! The Schraderbrau scalar field over 29-bit limbs, used on WebAssembly.
+//!
+//! Limbs are stored in `u32`s, and products of limbs are summed in `u64` accumulators. A limb
+//! product takes at most 58 bits, so an accumulator can absorb up to 64 of them before overflowing,
+//! which allows multiplication algorithms to defer carry propagation. That makes this
+//! representation a good fit for targets that lack a 64x64->128-bit multiplication and a carry
+//! flag, such as WebAssembly.
+//!
+//! Additions and subtractions involve no products, so they can process the limbs in 58-bit pairs
+//! (see [`join`]) to halve the length of their carry chains.
+
 use anyhow::{self, Context};
 use getrandom;
 use primitive_types::{H512, U256, U512};
-use starkom_ff::{
-    Field, Field256, PrimeField, PrimeField256,
-    helpers::{adc, add, mac, mul, sbb, sub},
-};
+use starkom_ff::{Field, Field256, PrimeField, PrimeField256};
 use std::cmp::Ordering;
 use std::iter::{Product, Sum};
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
@@ -14,6 +22,49 @@ use subtle::{
     Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess,
     CtOption,
 };
+
+/// The number of bits in a limb.
+const LIMB_BITS: u32 = 29;
+
+/// Selects the lower `LIMB_BITS` bits of a `u32`.
+const LIMB_MASK: u32 = (1 << LIMB_BITS) - 1;
+
+/// The number of limbs needed to store a 256-bit value.
+const LIMBS: usize = 9;
+
+/// The number of bits in a pair of limbs.
+const PAIR_BITS: u32 = 2 * LIMB_BITS;
+
+/// Joins two limbs into a 58-bit pair.
+#[inline(always)]
+const fn join(low: u32, high: u32) -> u64 {
+    low as u64 | (high as u64) << LIMB_BITS
+}
+
+/// Splits an accumulator into the (limb, carry) pair, where the limb is made of the lower
+/// `LIMB_BITS` bits and the carry of the remaining ones.
+#[inline(always)]
+const fn split(value: u64) -> (u32, u64) {
+    (value as u32 & LIMB_MASK, value >> LIMB_BITS)
+}
+
+/// Returns the lower limb of a pair, ie. its bits from 0 to 28.
+#[inline(always)]
+const fn low_limb(pair: u64) -> u32 {
+    pair as u32 & LIMB_MASK
+}
+
+/// Returns the higher limb of a pair, ie. its bits from 29 to 57.
+#[inline(always)]
+const fn high_limb(pair: u64) -> u32 {
+    (pair >> LIMB_BITS) as u32 & LIMB_MASK
+}
+
+/// Computes `a + b * c`, where `a` is an accumulator and `b` and `c` are limbs.
+#[inline(always)]
+const fn mac(a: u64, b: u32, c: u32) -> u64 {
+    a + (b as u64) * (c as u64)
+}
 
 /// The prime order of the Schraderbrau field stored as four 64-bit limbs in little endian order.
 pub const MODULUS: [u64; 4] = [
@@ -39,53 +90,198 @@ static CHARACTERS_LOWER_CASE: &'static [u8] = b"0123456789abcdefghijklmnopqrstuv
 /// divided by 2^62, supporting polynomials of extremely high degree. Unlike BlueSky, p-1 is not
 /// divisible by 3, so this field does not support ternary FRI.
 ///
-/// All our scalars are stored in Montgomery form with the four limbs stored in little-endian order.
+/// All our scalars are stored in Montgomery form with R = 2^261, as nine 29-bit limbs in
+/// little-endian order. This representation targets platforms lacking a 64x64->128-bit
+/// multiplication, such as WebAssembly: the product of two limbs fits in 58 bits, so many such
+/// products can be summed in a 64-bit accumulator before any carry needs to be propagated.
 #[derive(Default, Copy, Clone, PartialEq, Eq)]
-pub struct Scalar(u64, u64, u64, u64);
+pub struct Scalar(u32, u32, u32, u32, u32, u32, u32, u32, u32);
 
 impl Scalar {
     /// The raw (non-Montgomery) little-endian representation of `MAX`.
     const MAX_RAW: Self = Self(
-        0x4000000000000000u64,
-        0xfffffffffffffffeu64,
-        0xffffffffffffffffu64,
-        0x7fffffffffffffffu64,
+        0x00000000u32,
+        0x00000000u32,
+        0x1fffff90u32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x007fffffu32,
     );
 
-    /// R in raw form, ie. the four limbs of `2^256 mod p` in little-endian order.
+    /// R in raw form, ie. `2^261 mod p`.
     const R: Self = Self(
-        0x7ffffffffffffffeu64,
-        0x0000000000000003u64,
-        0x0000000000000000u64,
-        0x0000000000000000u64,
+        0x1fffffc0u32,
+        0x1fffffffu32,
+        0x00001bffu32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
     );
 
     /// R in Montgomery form, ie. R^2 mod p.
     const R2: Self = Self(
-        0x0000000000000004u64,
-        0x3ffffffffffffff2u64,
-        0x000000000000000cu64,
-        0x0000000000000000u64,
+        0x00001000u32,
+        0x00000000u32,
+        0x1ff20000u32,
+        0x1fffffffu32,
+        0x030fffffu32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
     );
 
-    const P: [u64; 4] = MODULUS;
+    /// p in raw form. Note that it's not a valid scalar, as it's not less than p.
+    const P: Self = Self(
+        0x00000001u32,
+        0x00000000u32,
+        0x1fffff90u32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x007fffffu32,
+    );
 
-    const P_INV: u64 = 0x3fffffffffffffffu64;
+    /// Constructs a scalar from a 256-bit value provided as four `u64`s in little-endian order,
+    /// without converting it to Montgomery form.
+    const fn from_u64s(u64s: [u64; 4]) -> Self {
+        Self(
+            u64s[0] as u32 & LIMB_MASK,
+            (u64s[0] >> 29) as u32 & LIMB_MASK,
+            (u64s[0] >> 58 | u64s[1] << 6) as u32 & LIMB_MASK,
+            (u64s[1] >> 23) as u32 & LIMB_MASK,
+            (u64s[1] >> 52 | u64s[2] << 12) as u32 & LIMB_MASK,
+            (u64s[2] >> 17) as u32 & LIMB_MASK,
+            (u64s[2] >> 46 | u64s[3] << 18) as u32 & LIMB_MASK,
+            (u64s[3] >> 11) as u32 & LIMB_MASK,
+            (u64s[3] >> 40) as u32 & LIMB_MASK,
+        )
+    }
 
-    /// Subtracts p. Assumes no underflow, ie. `self` must be greater than or equal to p.
+    /// Returns the limbs as four `u64`s in little-endian order, without converting from Montgomery
+    /// form. Bits beyond the 256th are discarded.
+    const fn to_u64s(&self) -> [u64; 4] {
+        [
+            self.0 as u64 | (self.1 as u64) << 29 | (self.2 as u64) << 58,
+            (self.2 as u64) >> 6 | (self.3 as u64) << 23 | (self.4 as u64) << 52,
+            (self.4 as u64) >> 12 | (self.5 as u64) << 17 | (self.6 as u64) << 46,
+            (self.6 as u64) >> 18 | (self.7 as u64) << 11 | (self.8 as u64) << 40,
+        ]
+    }
+
+    /// Adds two numbers limb by limb, without modular reduction, and returns the (sum, carry)
+    /// pair, where the carry is 0 or 1.
     ///
-    /// Used in several algorithms to bring a value back into the [0, p) range.
-    const fn subp(&self) -> Self {
-        let (s0, b0) = sub(self.0, Self::P[0]);
-        let (s1, b1) = sbb(self.1, Self::P[1], b0);
-        let (s2, b2) = sbb(self.2, Self::P[2], b1);
-        let (s3, _) = sbb(self.3, Self::P[3], b2);
-        Self(s0, s1, s2, s3)
+    /// The limbs are added in pairs, so that the carry chain takes 5 steps rather than 9: a 58-bit
+    /// pair leaves enough room in a `u64` to extract the carry with a shift.
+    #[inline(always)]
+    const fn add_limbs(&self, rhs: &Self) -> (Self, u32) {
+        let sum01 = join(self.0, self.1) + join(rhs.0, rhs.1);
+        let sum23 = join(self.2, self.3) + join(rhs.2, rhs.3) + (sum01 >> PAIR_BITS);
+        let sum45 = join(self.4, self.5) + join(rhs.4, rhs.5) + (sum23 >> PAIR_BITS);
+        let sum67 = join(self.6, self.7) + join(rhs.6, rhs.7) + (sum45 >> PAIR_BITS);
+        let sum8 = self.8 as u64 + rhs.8 as u64 + (sum67 >> PAIR_BITS);
+        (
+            Self(
+                low_limb(sum01),
+                high_limb(sum01),
+                low_limb(sum23),
+                high_limb(sum23),
+                low_limb(sum45),
+                high_limb(sum45),
+                low_limb(sum67),
+                high_limb(sum67),
+                low_limb(sum8),
+            ),
+            (sum8 >> LIMB_BITS) as u32,
+        )
+    }
+
+    /// Subtracts `rhs` limb by limb, without modular reduction, and returns the (difference,
+    /// borrow) pair, where the borrow is 0 or 1.
+    ///
+    /// If the borrow is 1 the difference has wrapped around 2^261. Like [`Self::add_limbs`], this
+    /// function processes the limbs in pairs to shorten the borrow chain.
+    #[inline(always)]
+    const fn sub_limbs(&self, rhs: &Self) -> (Self, u32) {
+        let diff01 = join(self.0, self.1).wrapping_sub(join(rhs.0, rhs.1));
+        let diff23 = join(self.2, self.3)
+            .wrapping_sub(join(rhs.2, rhs.3))
+            .wrapping_sub(diff01 >> 63);
+        let diff45 = join(self.4, self.5)
+            .wrapping_sub(join(rhs.4, rhs.5))
+            .wrapping_sub(diff23 >> 63);
+        let diff67 = join(self.6, self.7)
+            .wrapping_sub(join(rhs.6, rhs.7))
+            .wrapping_sub(diff45 >> 63);
+        let diff8 = (self.8 as u64)
+            .wrapping_sub(rhs.8 as u64)
+            .wrapping_sub(diff67 >> 63);
+        (
+            Self(
+                low_limb(diff01),
+                high_limb(diff01),
+                low_limb(diff23),
+                high_limb(diff23),
+                low_limb(diff45),
+                high_limb(diff45),
+                low_limb(diff67),
+                high_limb(diff67),
+                low_limb(diff8),
+            ),
+            (diff8 >> 63) as u32,
+        )
+    }
+
+    /// Brings a value in the range [0, 2p) back into [0, p) by subtracting p if necessary.
+    const fn modp(self) -> Self {
+        let (diff, borrow) = self.sub_limbs(&Self::P);
+        // The borrow is 1 iff `self` is less than p, in which case we must keep it.
+        let keep = 0u32.wrapping_sub(borrow);
+        Self(
+            (self.0 & keep) | (diff.0 & !keep),
+            (self.1 & keep) | (diff.1 & !keep),
+            (self.2 & keep) | (diff.2 & !keep),
+            (self.3 & keep) | (diff.3 & !keep),
+            (self.4 & keep) | (diff.4 & !keep),
+            (self.5 & keep) | (diff.5 & !keep),
+            (self.6 & keep) | (diff.6 & !keep),
+            (self.7 & keep) | (diff.7 & !keep),
+            (self.8 & keep) | (diff.8 & !keep),
+        )
     }
 
     /// Compares raw scalars, ignoring Montgomery form.
     const fn cmp_raw(&self, other: &Self) -> Ordering {
-        if self.3 < other.3 {
+        if self.8 < other.8 {
+            Ordering::Less
+        } else if self.8 > other.8 {
+            Ordering::Greater
+        } else if self.7 < other.7 {
+            Ordering::Less
+        } else if self.7 > other.7 {
+            Ordering::Greater
+        } else if self.6 < other.6 {
+            Ordering::Less
+        } else if self.6 > other.6 {
+            Ordering::Greater
+        } else if self.5 < other.5 {
+            Ordering::Less
+        } else if self.5 > other.5 {
+            Ordering::Greater
+        } else if self.4 < other.4 {
+            Ordering::Less
+        } else if self.4 > other.4 {
+            Ordering::Greater
+        } else if self.3 < other.3 {
             Ordering::Less
         } else if self.3 > other.3 {
             Ordering::Greater
@@ -106,144 +302,314 @@ impl Scalar {
         }
     }
 
-    const fn modp(self) -> Self {
-        let subp = self.subp();
-        match self.cmp_raw(&Self::MAX_RAW) {
-            Ordering::Greater => subp,
-            _ => self,
-        }
-    }
-
-    /// Performs Montgomery multiplication using CIOS over 64-bit limbs.
+    /// Performs Montgomery multiplication using separated operand scanning over 29-bit limbs.
+    ///
+    /// All 81 limb products are summed into 18 column accumulators without propagating any carry,
+    /// then [`Self::mont_reduce`] divides the result by R modulo p.
     const fn mont_mul(lhs: &Self, rhs: &Self) -> Self {
-        let mut t0: u64;
-        let mut t1: u64;
-        let mut t2: u64;
-        let mut t3: u64;
-        let mut t4: u64;
-        let mut carry: u64;
-        let mut m: u64;
+        let mut col = [0u64; 2 * LIMBS];
 
         // row 0
-        (t0, carry) = mul(lhs.0, rhs.0, 0);
-        (t1, carry) = mul(lhs.1, rhs.0, carry);
-        (t2, carry) = mul(lhs.2, rhs.0, carry);
-        (t3, t4) = mul(lhs.3, rhs.0, carry);
-
-        // redc 0
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = t4 + carry;
+        col[0] = mac(col[0], lhs.0, rhs.0);
+        col[1] = mac(col[1], lhs.0, rhs.1);
+        col[2] = mac(col[2], lhs.0, rhs.2);
+        col[3] = mac(col[3], lhs.0, rhs.3);
+        col[4] = mac(col[4], lhs.0, rhs.4);
+        col[5] = mac(col[5], lhs.0, rhs.5);
+        col[6] = mac(col[6], lhs.0, rhs.6);
+        col[7] = mac(col[7], lhs.0, rhs.7);
+        col[8] = mac(col[8], lhs.0, rhs.8);
 
         // row 1
-        (t0, carry) = mac(t0, lhs.0, rhs.1, 0);
-        (t1, carry) = mac(t1, lhs.1, rhs.1, carry);
-        (t2, carry) = mac(t2, lhs.2, rhs.1, carry);
-        (t3, t4) = mac(t3, lhs.3, rhs.1, carry);
-
-        // redc 1
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = t4 + carry;
+        col[1] = mac(col[1], lhs.1, rhs.0);
+        col[2] = mac(col[2], lhs.1, rhs.1);
+        col[3] = mac(col[3], lhs.1, rhs.2);
+        col[4] = mac(col[4], lhs.1, rhs.3);
+        col[5] = mac(col[5], lhs.1, rhs.4);
+        col[6] = mac(col[6], lhs.1, rhs.5);
+        col[7] = mac(col[7], lhs.1, rhs.6);
+        col[8] = mac(col[8], lhs.1, rhs.7);
+        col[9] = mac(col[9], lhs.1, rhs.8);
 
         // row 2
-        (t0, carry) = mac(t0, lhs.0, rhs.2, 0);
-        (t1, carry) = mac(t1, lhs.1, rhs.2, carry);
-        (t2, carry) = mac(t2, lhs.2, rhs.2, carry);
-        (t3, t4) = mac(t3, lhs.3, rhs.2, carry);
-
-        // redc 2
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = t4 + carry;
+        col[2] = mac(col[2], lhs.2, rhs.0);
+        col[3] = mac(col[3], lhs.2, rhs.1);
+        col[4] = mac(col[4], lhs.2, rhs.2);
+        col[5] = mac(col[5], lhs.2, rhs.3);
+        col[6] = mac(col[6], lhs.2, rhs.4);
+        col[7] = mac(col[7], lhs.2, rhs.5);
+        col[8] = mac(col[8], lhs.2, rhs.6);
+        col[9] = mac(col[9], lhs.2, rhs.7);
+        col[10] = mac(col[10], lhs.2, rhs.8);
 
         // row 3
-        (t0, carry) = mac(t0, lhs.0, rhs.3, 0);
-        (t1, carry) = mac(t1, lhs.1, rhs.3, carry);
-        (t2, carry) = mac(t2, lhs.2, rhs.3, carry);
-        (t3, t4) = mac(t3, lhs.3, rhs.3, carry);
+        col[3] = mac(col[3], lhs.3, rhs.0);
+        col[4] = mac(col[4], lhs.3, rhs.1);
+        col[5] = mac(col[5], lhs.3, rhs.2);
+        col[6] = mac(col[6], lhs.3, rhs.3);
+        col[7] = mac(col[7], lhs.3, rhs.4);
+        col[8] = mac(col[8], lhs.3, rhs.5);
+        col[9] = mac(col[9], lhs.3, rhs.6);
+        col[10] = mac(col[10], lhs.3, rhs.7);
+        col[11] = mac(col[11], lhs.3, rhs.8);
 
-        // redc 3
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = t4 + carry;
+        // row 4
+        col[4] = mac(col[4], lhs.4, rhs.0);
+        col[5] = mac(col[5], lhs.4, rhs.1);
+        col[6] = mac(col[6], lhs.4, rhs.2);
+        col[7] = mac(col[7], lhs.4, rhs.3);
+        col[8] = mac(col[8], lhs.4, rhs.4);
+        col[9] = mac(col[9], lhs.4, rhs.5);
+        col[10] = mac(col[10], lhs.4, rhs.6);
+        col[11] = mac(col[11], lhs.4, rhs.7);
+        col[12] = mac(col[12], lhs.4, rhs.8);
 
-        Self(t0, t1, t2, t3).modp()
+        // row 5
+        col[5] = mac(col[5], lhs.5, rhs.0);
+        col[6] = mac(col[6], lhs.5, rhs.1);
+        col[7] = mac(col[7], lhs.5, rhs.2);
+        col[8] = mac(col[8], lhs.5, rhs.3);
+        col[9] = mac(col[9], lhs.5, rhs.4);
+        col[10] = mac(col[10], lhs.5, rhs.5);
+        col[11] = mac(col[11], lhs.5, rhs.6);
+        col[12] = mac(col[12], lhs.5, rhs.7);
+        col[13] = mac(col[13], lhs.5, rhs.8);
+
+        // row 6
+        col[6] = mac(col[6], lhs.6, rhs.0);
+        col[7] = mac(col[7], lhs.6, rhs.1);
+        col[8] = mac(col[8], lhs.6, rhs.2);
+        col[9] = mac(col[9], lhs.6, rhs.3);
+        col[10] = mac(col[10], lhs.6, rhs.4);
+        col[11] = mac(col[11], lhs.6, rhs.5);
+        col[12] = mac(col[12], lhs.6, rhs.6);
+        col[13] = mac(col[13], lhs.6, rhs.7);
+        col[14] = mac(col[14], lhs.6, rhs.8);
+
+        // row 7
+        col[7] = mac(col[7], lhs.7, rhs.0);
+        col[8] = mac(col[8], lhs.7, rhs.1);
+        col[9] = mac(col[9], lhs.7, rhs.2);
+        col[10] = mac(col[10], lhs.7, rhs.3);
+        col[11] = mac(col[11], lhs.7, rhs.4);
+        col[12] = mac(col[12], lhs.7, rhs.5);
+        col[13] = mac(col[13], lhs.7, rhs.6);
+        col[14] = mac(col[14], lhs.7, rhs.7);
+        col[15] = mac(col[15], lhs.7, rhs.8);
+
+        // row 8
+        col[8] = mac(col[8], lhs.8, rhs.0);
+        col[9] = mac(col[9], lhs.8, rhs.1);
+        col[10] = mac(col[10], lhs.8, rhs.2);
+        col[11] = mac(col[11], lhs.8, rhs.3);
+        col[12] = mac(col[12], lhs.8, rhs.4);
+        col[13] = mac(col[13], lhs.8, rhs.5);
+        col[14] = mac(col[14], lhs.8, rhs.6);
+        col[15] = mac(col[15], lhs.8, rhs.7);
+        col[16] = mac(col[16], lhs.8, rhs.8);
+
+        Self::mont_reduce(col)
     }
 
-    /// Performs a Montgomery multiplication by 1, which results in converting from Montgomery form
-    /// to raw form.
+    /// Performs a Montgomery reduction, ie. computes `t / R mod p` where `t` is provided as 18
+    /// little-endian column accumulators, the column `i` having weight 2^(29*i).
     ///
-    /// This is exactly the same as `mont_mul(Scalar(1, 0, 0, 0))` but slightly faster because it
-    /// exploits the fact that we're multiplying by (1, 0, 0, 0), so it skips all "row" phases and
-    /// only performs the "redc" phases.
+    /// The result is in [0, p) as long as `t < p * R`. Each column receives at most 9 limb products
+    /// from a multiplication, 9 more from the reduction, and one carry, so its accumulator never
+    /// exceeds `18 * 2^58 + 2^35 < 2^64`.
+    ///
+    /// In row `i`, adding `m` times p zeroes the lower 29 bits of column `i`, so its carry moves up
+    /// into column `i + 1` exactly. In general `m = -p^-1 * col[i] mod 2^29`, but p = 1 mod 2^62, so
+    /// `-p^-1 = -1 mod 2^29` and `m` is just the negation of column `i` modulo 2^29.
+    const fn mont_reduce(mut col: [u64; 2 * LIMBS]) -> Self {
+        let mut m: u32;
+
+        // row 0
+        m = (col[0] as u32).wrapping_neg() & LIMB_MASK;
+        col[0] = mac(col[0], m, Self::P.0);
+        col[1] = mac(col[1], m, Self::P.1);
+        col[2] = mac(col[2], m, Self::P.2);
+        col[3] = mac(col[3], m, Self::P.3);
+        col[4] = mac(col[4], m, Self::P.4);
+        col[5] = mac(col[5], m, Self::P.5);
+        col[6] = mac(col[6], m, Self::P.6);
+        col[7] = mac(col[7], m, Self::P.7);
+        col[8] = mac(col[8], m, Self::P.8);
+        col[1] += col[0] >> LIMB_BITS;
+
+        // row 1
+        m = (col[1] as u32).wrapping_neg() & LIMB_MASK;
+        col[1] = mac(col[1], m, Self::P.0);
+        col[2] = mac(col[2], m, Self::P.1);
+        col[3] = mac(col[3], m, Self::P.2);
+        col[4] = mac(col[4], m, Self::P.3);
+        col[5] = mac(col[5], m, Self::P.4);
+        col[6] = mac(col[6], m, Self::P.5);
+        col[7] = mac(col[7], m, Self::P.6);
+        col[8] = mac(col[8], m, Self::P.7);
+        col[9] = mac(col[9], m, Self::P.8);
+        col[2] += col[1] >> LIMB_BITS;
+
+        // row 2
+        m = (col[2] as u32).wrapping_neg() & LIMB_MASK;
+        col[2] = mac(col[2], m, Self::P.0);
+        col[3] = mac(col[3], m, Self::P.1);
+        col[4] = mac(col[4], m, Self::P.2);
+        col[5] = mac(col[5], m, Self::P.3);
+        col[6] = mac(col[6], m, Self::P.4);
+        col[7] = mac(col[7], m, Self::P.5);
+        col[8] = mac(col[8], m, Self::P.6);
+        col[9] = mac(col[9], m, Self::P.7);
+        col[10] = mac(col[10], m, Self::P.8);
+        col[3] += col[2] >> LIMB_BITS;
+
+        // row 3
+        m = (col[3] as u32).wrapping_neg() & LIMB_MASK;
+        col[3] = mac(col[3], m, Self::P.0);
+        col[4] = mac(col[4], m, Self::P.1);
+        col[5] = mac(col[5], m, Self::P.2);
+        col[6] = mac(col[6], m, Self::P.3);
+        col[7] = mac(col[7], m, Self::P.4);
+        col[8] = mac(col[8], m, Self::P.5);
+        col[9] = mac(col[9], m, Self::P.6);
+        col[10] = mac(col[10], m, Self::P.7);
+        col[11] = mac(col[11], m, Self::P.8);
+        col[4] += col[3] >> LIMB_BITS;
+
+        // row 4
+        m = (col[4] as u32).wrapping_neg() & LIMB_MASK;
+        col[4] = mac(col[4], m, Self::P.0);
+        col[5] = mac(col[5], m, Self::P.1);
+        col[6] = mac(col[6], m, Self::P.2);
+        col[7] = mac(col[7], m, Self::P.3);
+        col[8] = mac(col[8], m, Self::P.4);
+        col[9] = mac(col[9], m, Self::P.5);
+        col[10] = mac(col[10], m, Self::P.6);
+        col[11] = mac(col[11], m, Self::P.7);
+        col[12] = mac(col[12], m, Self::P.8);
+        col[5] += col[4] >> LIMB_BITS;
+
+        // row 5
+        m = (col[5] as u32).wrapping_neg() & LIMB_MASK;
+        col[5] = mac(col[5], m, Self::P.0);
+        col[6] = mac(col[6], m, Self::P.1);
+        col[7] = mac(col[7], m, Self::P.2);
+        col[8] = mac(col[8], m, Self::P.3);
+        col[9] = mac(col[9], m, Self::P.4);
+        col[10] = mac(col[10], m, Self::P.5);
+        col[11] = mac(col[11], m, Self::P.6);
+        col[12] = mac(col[12], m, Self::P.7);
+        col[13] = mac(col[13], m, Self::P.8);
+        col[6] += col[5] >> LIMB_BITS;
+
+        // row 6
+        m = (col[6] as u32).wrapping_neg() & LIMB_MASK;
+        col[6] = mac(col[6], m, Self::P.0);
+        col[7] = mac(col[7], m, Self::P.1);
+        col[8] = mac(col[8], m, Self::P.2);
+        col[9] = mac(col[9], m, Self::P.3);
+        col[10] = mac(col[10], m, Self::P.4);
+        col[11] = mac(col[11], m, Self::P.5);
+        col[12] = mac(col[12], m, Self::P.6);
+        col[13] = mac(col[13], m, Self::P.7);
+        col[14] = mac(col[14], m, Self::P.8);
+        col[7] += col[6] >> LIMB_BITS;
+
+        // row 7
+        m = (col[7] as u32).wrapping_neg() & LIMB_MASK;
+        col[7] = mac(col[7], m, Self::P.0);
+        col[8] = mac(col[8], m, Self::P.1);
+        col[9] = mac(col[9], m, Self::P.2);
+        col[10] = mac(col[10], m, Self::P.3);
+        col[11] = mac(col[11], m, Self::P.4);
+        col[12] = mac(col[12], m, Self::P.5);
+        col[13] = mac(col[13], m, Self::P.6);
+        col[14] = mac(col[14], m, Self::P.7);
+        col[15] = mac(col[15], m, Self::P.8);
+        col[8] += col[7] >> LIMB_BITS;
+
+        // row 8
+        m = (col[8] as u32).wrapping_neg() & LIMB_MASK;
+        col[8] = mac(col[8], m, Self::P.0);
+        col[9] = mac(col[9], m, Self::P.1);
+        col[10] = mac(col[10], m, Self::P.2);
+        col[11] = mac(col[11], m, Self::P.3);
+        col[12] = mac(col[12], m, Self::P.4);
+        col[13] = mac(col[13], m, Self::P.5);
+        col[14] = mac(col[14], m, Self::P.6);
+        col[15] = mac(col[15], m, Self::P.7);
+        col[16] = mac(col[16], m, Self::P.8);
+        col[9] += col[8] >> LIMB_BITS;
+
+        let (limb0, carry) = split(col[9]);
+        let (limb1, carry) = split(col[10] + carry);
+        let (limb2, carry) = split(col[11] + carry);
+        let (limb3, carry) = split(col[12] + carry);
+        let (limb4, carry) = split(col[13] + carry);
+        let (limb5, carry) = split(col[14] + carry);
+        let (limb6, carry) = split(col[15] + carry);
+        let (limb7, carry) = split(col[16] + carry);
+        let (limb8, _) = split(col[17] + carry);
+        Self(
+            limb0, limb1, limb2, limb3, limb4, limb5, limb6, limb7, limb8,
+        )
+        .modp()
+    }
+
+    /// Converts from Montgomery form to raw form.
+    ///
+    /// This is exactly the same as `mont_mul(Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0))` but slightly
+    /// faster because it skips the products and only performs the reduction.
     const fn to_raw(&self) -> Self {
-        let mut t0 = self.0;
-        let mut t1 = self.1;
-        let mut t2 = self.2;
-        let mut t3 = self.3;
-        let mut carry: u64;
-        let mut m: u64;
+        Self::mont_reduce([
+            self.0 as u64,
+            self.1 as u64,
+            self.2 as u64,
+            self.3 as u64,
+            self.4 as u64,
+            self.5 as u64,
+            self.6 as u64,
+            self.7 as u64,
+            self.8 as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+    }
 
-        // redc 0
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = carry;
+    /// Returns the raw (non-Montgomery) value as four `u64`s in little-endian order.
+    const fn to_raw_u64s(&self) -> [u64; 4] {
+        self.to_raw().to_u64s()
+    }
 
-        // redc 1
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = carry;
+    /// Converts a raw (non-Montgomery) value to Montgomery form. The value must be less than p.
+    const fn from_raw(raw: Self) -> Self {
+        Self::mont_mul(&raw, &Self::R2)
+    }
 
-        // redc 2
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = carry;
-
-        // redc 3
-        m = t0.wrapping_mul(Self::P_INV);
-        (_, carry) = mac(t0, m, Self::P[0], 0);
-        (t0, carry) = mac(t1, m, Self::P[1], carry);
-        (t1, carry) = mac(t2, m, Self::P[2], carry);
-        (t2, carry) = mac(t3, m, Self::P[3], carry);
-        t3 = carry;
-
-        Self(t0, t1, t2, t3).modp()
+    /// Converts a raw (non-Montgomery) value provided as four `u64`s in little-endian order to
+    /// Montgomery form. The value must be less than p.
+    const fn from_raw_u64s(u64s: [u64; 4]) -> Self {
+        Self::from_raw(Self::from_u64s(u64s))
     }
 
     /// Converts a raw (non-Montgomery) value to Montgomery form, returning `None` if it's not
     /// canonical, ie. if it's not less than p.
     fn try_from_raw(raw: Self) -> CtOption<Self> {
         let is_canonical = Choice::from((raw.cmp_raw(&Self::MAX_RAW) != Ordering::Greater) as u8);
-        let raw = Self::conditional_select(&Self(0, 0, 0, 0), &raw, is_canonical);
-        CtOption::new(Self::mont_mul(&raw, &Self::R2), is_canonical)
+        let raw = Self::conditional_select(&Self::ZERO, &raw, is_canonical);
+        CtOption::new(Self::from_raw(raw), is_canonical)
     }
 
     /// Constructs scalars at compile time.
     pub const fn from_const(value: u64) -> Scalar {
-        let raw = Self(value, 0, 0, 0);
-        Self::mont_mul(&raw, &Self::R2)
+        Self::from_raw_u64s([value, 0, 0, 0])
     }
 
     fn to_string_impl(&self, radix: usize, pad_to: usize, upper_case: bool) -> String {
@@ -366,6 +732,11 @@ impl ConstantTimeEq for Scalar {
             & self.1.ct_eq(&other.1)
             & self.2.ct_eq(&other.2)
             & self.3.ct_eq(&other.3)
+            & self.4.ct_eq(&other.4)
+            & self.5.ct_eq(&other.5)
+            & self.6.ct_eq(&other.6)
+            & self.7.ct_eq(&other.7)
+            & self.8.ct_eq(&other.8)
     }
 }
 
@@ -373,14 +744,8 @@ impl ConstantTimeGreater for Scalar {
     fn ct_gt(&self, other: &Self) -> Choice {
         let lhs = self.to_raw();
         let rhs = other.to_raw();
-        let gt3 = lhs.3.ct_gt(&rhs.3);
-        let gt2 = lhs.2.ct_gt(&rhs.2);
-        let gt1 = lhs.1.ct_gt(&rhs.1);
-        let gt0 = lhs.0.ct_gt(&rhs.0);
-        let eq3 = lhs.3.ct_eq(&rhs.3);
-        let eq2 = lhs.2.ct_eq(&rhs.2);
-        let eq1 = lhs.1.ct_eq(&rhs.1);
-        gt3 | eq3 & gt2 | eq3 & eq2 & gt1 | eq3 & eq2 & eq1 & gt0
+        let (_, borrow) = rhs.sub_limbs(&lhs);
+        Choice::from(borrow as u8)
     }
 }
 
@@ -389,10 +754,15 @@ impl ConstantTimeLess for Scalar {}
 impl ConditionallySelectable for Scalar {
     fn conditional_select(a: &Self, b: &Self, choice: subtle::Choice) -> Self {
         Scalar(
-            u64::conditional_select(&a.0, &b.0, choice),
-            u64::conditional_select(&a.1, &b.1, choice),
-            u64::conditional_select(&a.2, &b.2, choice),
-            u64::conditional_select(&a.3, &b.3, choice),
+            u32::conditional_select(&a.0, &b.0, choice),
+            u32::conditional_select(&a.1, &b.1, choice),
+            u32::conditional_select(&a.2, &b.2, choice),
+            u32::conditional_select(&a.3, &b.3, choice),
+            u32::conditional_select(&a.4, &b.4, choice),
+            u32::conditional_select(&a.5, &b.5, choice),
+            u32::conditional_select(&a.6, &b.6, choice),
+            u32::conditional_select(&a.7, &b.7, choice),
+            u32::conditional_select(&a.8, &b.8, choice),
         )
     }
 }
@@ -401,11 +771,8 @@ impl Add<&Scalar> for Scalar {
     type Output = Self;
 
     fn add(self, rhs: &Self) -> Self::Output {
-        let (r0, c0) = add(self.0, rhs.0);
-        let (r1, c1) = adc(self.1, rhs.1, c0);
-        let (r2, c2) = adc(self.2, rhs.2, c1);
-        let (r3, _) = adc(self.3, rhs.3, c2);
-        Self(r0, r1, r2, r3).modp()
+        let (sum, _) = self.add_limbs(rhs);
+        sum.modp()
     }
 }
 
@@ -436,11 +803,8 @@ impl Neg for Scalar {
         if self.is_zero().into() {
             return self;
         }
-        let (r0, b0) = sub(Self::P[0], self.0);
-        let (r1, b1) = sbb(Self::P[1], self.1, b0);
-        let (r2, b2) = sbb(Self::P[2], self.2, b1);
-        let (r3, _) = sbb(Self::P[3], self.3, b2);
-        Self(r0, r1, r2, r3)
+        let (diff, _) = Self::P.sub_limbs(&self);
+        diff
     }
 }
 
@@ -448,18 +812,22 @@ impl Sub<&Scalar> for Scalar {
     type Output = Self;
 
     fn sub(self, rhs: &Self) -> Self::Output {
-        let (r0, b0) = sub(self.0, rhs.0);
-        let (r1, b1) = sbb(self.1, rhs.1, b0);
-        let (r2, b2) = sbb(self.2, rhs.2, b1);
-        let (r3, b3) = sbb(self.3, rhs.3, b2);
-        if b3 == 0 {
-            return Self(r0, r1, r2, r3);
-        }
-        let (s0, c0) = add(r0, Self::P[0]);
-        let (s1, c1) = adc(r1, Self::P[1], c0);
-        let (s2, c2) = adc(r2, Self::P[2], c1);
-        let (s3, _) = adc(r3, Self::P[3], c2);
-        Self(s0, s1, s2, s3)
+        let (diff, borrow) = self.sub_limbs(rhs);
+        // If the subtraction wrapped around 2^261 we add p, and the final carry wraps it back.
+        let mask = 0u32.wrapping_sub(borrow);
+        let correction = Self(
+            Self::P.0 & mask,
+            Self::P.1 & mask,
+            Self::P.2 & mask,
+            Self::P.3 & mask,
+            Self::P.4 & mask,
+            Self::P.5 & mask,
+            Self::P.6 & mask,
+            Self::P.7 & mask,
+            Self::P.8 & mask,
+        );
+        let (result, _) = diff.add_limbs(&correction);
+        result
     }
 }
 
@@ -587,31 +955,31 @@ impl FromStr for Scalar {
 
 impl From<u8> for Scalar {
     fn from(value: u8) -> Self {
-        Self::mont_mul(&Self(value as u64, 0, 0, 0), &Self::R2)
+        Self::from_raw_u64s([value as u64, 0, 0, 0])
     }
 }
 
 impl From<u16> for Scalar {
     fn from(value: u16) -> Self {
-        Self::mont_mul(&Self(value as u64, 0, 0, 0), &Self::R2)
+        Self::from_raw_u64s([value as u64, 0, 0, 0])
     }
 }
 
 impl From<u32> for Scalar {
     fn from(value: u32) -> Self {
-        Self::mont_mul(&Self(value as u64, 0, 0, 0), &Self::R2)
+        Self::from_raw_u64s([value as u64, 0, 0, 0])
     }
 }
 
 impl From<u64> for Scalar {
     fn from(value: u64) -> Self {
-        Self::mont_mul(&Self(value, 0, 0, 0), &Self::R2)
+        Self::from_raw_u64s([value, 0, 0, 0])
     }
 }
 
 impl From<u128> for Scalar {
     fn from(value: u128) -> Self {
-        Self::mont_mul(&Self(value as u64, (value >> 64) as u64, 0, 0), &Self::R2)
+        Self::from_raw_u64s([value as u64, (value >> 64) as u64, 0, 0])
     }
 }
 
@@ -629,7 +997,7 @@ impl TryFrom<usize> for Scalar {
     type Error = anyhow::Error;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Ok(Self::mont_mul(&Self(value as u64, 0, 0, 0), &Self::R2))
+        Ok(Self::from_raw_u64s([value as u64, 0, 0, 0]))
     }
 }
 
@@ -646,63 +1014,98 @@ impl Field for Scalar {
 
     const NUM_BITS: usize = 255;
 
-    const ZERO: Self = Self(0, 0, 0, 0);
+    const ZERO: Self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0);
 
     const ONE: Self = Self::R;
 
     const MAX: Self = Self(
-        0xc000000000000003u64,
-        0xfffffffffffffffau64,
-        0xffffffffffffffffu64,
-        0x7fffffffffffffffu64,
+        0x00000041u32,
+        0x00000000u32,
+        0x1fffe390u32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x007fffffu32,
     );
 
     const S: usize = 62;
 
     const MULTIPLICATIVE_GENERATOR: Self = Self(
-        0x7ffffffffffffffau64,
-        0x000000000000000au64,
-        0x0000000000000000u64,
-        0x0000000000000000u64,
+        0x1fffff40u32,
+        0x1fffffffu32,
+        0x000053ffu32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
     );
 
     const MINUS_TWO: Self = Self(
-        0x4000000000000005u64,
-        0xfffffffffffffff7u64,
-        0xffffffffffffffffu64,
-        0x7fffffffffffffffu64,
+        0x00000081u32,
+        0x00000000u32,
+        0x1fffc790u32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x1fffffffu32,
+        0x007fffffu32,
     );
 
     const TWO_INV: Self = Self(
-        0xbfffffffffffffffu64,
-        0x0000000000000001u64,
-        0x0000000000000000u64,
-        0x0000000000000000u64,
+        0x1fffffe0u32,
+        0x1fffffffu32,
+        0x00000dffu32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
     );
 
     const ROOT_OF_UNITY: Self = Self(
-        0xe5bbac717a361622u64,
-        0xbbaab957e6cb3b09u64,
-        0x67a5fd5b5fbc8c0au64,
-        0x64759b85442c90c3u64,
+        0x06c2c427u32,
+        0x1bac717au32,
+        0x19d85a1du32,
+        0x0e55f9b2u32,
+        0x18157755u32,
+        0x15b5fbc8u32,
+        0x01b3d2feu32,
+        0x1510b243u32,
+        0x000eb370u32,
     );
 
     const ROOT_OF_UNITY_INV: Self = Self(
-        0x3a83f68af040bd72u64,
-        0x09af02daf8c40bd0u64,
-        0x531373437f331f83u64,
-        0x726b81ad9bfd1b6du64,
+        0x0817ae24u32,
+        0x03f68af0u32,
+        0x005e8e14u32,
+        0x00b6be31u32,
+        0x1f06135eu32,
+        0x1437f331u32,
+        0x16a989b9u32,
+        0x166ff46du32,
+        0x004d7035u32,
     );
 
     const DELTA: Self = Self(
-        0x7598ae74ce578f05u64,
-        0xba2bff2c34d61023u64,
-        0x7d1b8d181f880888u64,
-        0x2363bda763dd50c0u64,
+        0x0af1e098u32,
+        0x18ae74ceu32,
+        0x10811f2cu32,
+        0x1fcb0d35u32,
+        0x11117457u32,
+        0x1181f880u32,
+        0x003e8dc6u32,
+        0x1d8f7543u32,
+        0x006c77b4u32,
     );
 
     fn is_odd(&self) -> Choice {
-        (self.to_le_bytes()[0] & 1).into()
+        Choice::from((self.to_raw().0 & 1) as u8)
     }
 
     fn try_random<R: rand_core::TryCryptoRng>(rng: &mut R) -> Result<Self, R::Error> {
@@ -728,12 +1131,18 @@ impl Field for Scalar {
     }
 
     fn double(&self) -> Self {
-        let mut value = *self;
-        value.3 = (value.3 << 1) | (value.2 >> 63);
-        value.2 = (value.2 << 1) | (value.1 >> 63);
-        value.1 = (value.1 << 1) | (value.0 >> 63);
-        value.0 = value.0 << 1;
-        value.modp()
+        Self(
+            (self.0 << 1) & LIMB_MASK,
+            ((self.1 << 1) | (self.0 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.2 << 1) | (self.1 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.3 << 1) | (self.2 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.4 << 1) | (self.3 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.5 << 1) | (self.4 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.6 << 1) | (self.5 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.7 << 1) | (self.6 >> (LIMB_BITS - 1))) & LIMB_MASK,
+            ((self.8 << 1) | (self.7 >> (LIMB_BITS - 1))) & LIMB_MASK,
+        )
+        .modp()
     }
 
     fn invert(&self) -> CtOption<Self> {
@@ -789,23 +1198,23 @@ impl Field for Scalar {
 
     fn try_from_le_bytes(bytes: &[u8]) -> CtOption<Self> {
         assert!(bytes.len() == 32);
-        let raw = Self(
+        let raw = Self::from_u64s([
             u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
             u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-        );
+        ]);
         Self::try_from_raw(raw)
     }
 
     fn try_from_be_bytes(bytes: &[u8]) -> CtOption<Self> {
         assert!(bytes.len() == 32);
-        let raw = Self(
+        let raw = Self::from_u64s([
             u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
             u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
             u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
             u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
-        );
+        ]);
         Self::try_from_raw(raw)
     }
 
@@ -844,56 +1253,55 @@ impl Field for Scalar {
     }
 
     fn try_to_u8(&self) -> Option<u8> {
-        let raw = self.to_raw();
-        if (raw.1, raw.2, raw.3) != (0, 0, 0) {
+        let raw = self.to_raw_u64s();
+        if (raw[1], raw[2], raw[3]) != (0, 0, 0) {
             return None;
         }
-        if raw.0 > u8::MAX as u64 {
+        if raw[0] > u8::MAX as u64 {
             return None;
         }
-        Some(raw.0 as u8)
+        Some(raw[0] as u8)
     }
 
     fn try_to_u16(&self) -> Option<u16> {
-        let raw = self.to_raw();
-        if (raw.1, raw.2, raw.3) != (0, 0, 0) {
+        let raw = self.to_raw_u64s();
+        if (raw[1], raw[2], raw[3]) != (0, 0, 0) {
             return None;
         }
-        if raw.0 > u16::MAX as u64 {
+        if raw[0] > u16::MAX as u64 {
             return None;
         }
-        Some(raw.0 as u16)
+        Some(raw[0] as u16)
     }
 
     fn to_u256(&self) -> U256 {
-        U256::from_little_endian(&self.to_le_bytes())
+        U256(self.to_raw_u64s())
     }
 
     fn to_u512(&self) -> U512 {
-        let mut bytes = [0u8; 64];
-        bytes[0..32].copy_from_slice(&self.to_le_bytes());
-        U512::from_little_endian(&bytes)
+        let raw = self.to_raw_u64s();
+        U512([raw[0], raw[1], raw[2], raw[3], 0, 0, 0, 0])
     }
 }
 
 impl Field256 for Scalar {
     fn to_le_bytes(&self) -> [u8; 32] {
-        let raw = self.to_raw();
+        let raw = self.to_raw_u64s();
         let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&raw.0.to_le_bytes());
-        bytes[8..16].copy_from_slice(&raw.1.to_le_bytes());
-        bytes[16..24].copy_from_slice(&raw.2.to_le_bytes());
-        bytes[24..32].copy_from_slice(&raw.3.to_le_bytes());
+        bytes[0..8].copy_from_slice(&raw[0].to_le_bytes());
+        bytes[8..16].copy_from_slice(&raw[1].to_le_bytes());
+        bytes[16..24].copy_from_slice(&raw[2].to_le_bytes());
+        bytes[24..32].copy_from_slice(&raw[3].to_le_bytes());
         bytes
     }
 
     fn to_be_bytes(&self) -> [u8; 32] {
-        let raw = self.to_raw();
+        let raw = self.to_raw_u64s();
         let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&raw.3.to_be_bytes());
-        bytes[8..16].copy_from_slice(&raw.2.to_be_bytes());
-        bytes[16..24].copy_from_slice(&raw.1.to_be_bytes());
-        bytes[24..32].copy_from_slice(&raw.0.to_be_bytes());
+        bytes[0..8].copy_from_slice(&raw[3].to_be_bytes());
+        bytes[8..16].copy_from_slice(&raw[2].to_be_bytes());
+        bytes[16..24].copy_from_slice(&raw[1].to_be_bytes());
+        bytes[24..32].copy_from_slice(&raw[0].to_be_bytes());
         bytes
     }
 
@@ -910,34 +1318,31 @@ impl Field256 for Scalar {
     }
 
     fn try_to_u32(&self) -> CtOption<u32> {
-        let raw = self.to_raw();
+        let raw = self.to_raw_u64s();
         CtOption::new(
-            raw.0 as u32,
-            Choice::from((raw.0 <= u32::MAX as u64) as u8)
-                & Choice::from((raw.1 == 0) as u8)
-                & Choice::from((raw.2 == 0) as u8)
-                & Choice::from((raw.3 == 0) as u8),
+            raw[0] as u32,
+            Choice::from((raw[0] <= u32::MAX as u64) as u8)
+                & Choice::from((raw[1] == 0) as u8)
+                & Choice::from((raw[2] == 0) as u8)
+                & Choice::from((raw[3] == 0) as u8),
         )
     }
 
     fn try_to_u64(&self) -> CtOption<u64> {
-        let raw = self.to_raw();
+        let raw = self.to_raw_u64s();
         CtOption::new(
-            raw.0 as u64,
-            Choice::from((raw.1 == 0) as u8)
-                & Choice::from((raw.2 == 0) as u8)
-                & Choice::from((raw.3 == 0) as u8),
+            raw[0],
+            Choice::from((raw[1] == 0) as u8)
+                & Choice::from((raw[2] == 0) as u8)
+                & Choice::from((raw[3] == 0) as u8),
         )
     }
 
     fn try_to_u128(&self) -> CtOption<u128> {
-        let raw = self.to_raw();
-        let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&raw.0.to_le_bytes());
-        bytes[8..16].copy_from_slice(&raw.1.to_le_bytes());
+        let raw = self.to_raw_u64s();
         CtOption::new(
-            u128::from_le_bytes(bytes),
-            Choice::from((raw.2 == 0) as u8) & Choice::from((raw.3 == 0) as u8),
+            (raw[1] as u128) << 64 | raw[0] as u128,
+            Choice::from((raw[2] == 0) as u8) & Choice::from((raw[3] == 0) as u8),
         )
     }
 }
@@ -951,6 +1356,61 @@ impl PrimeField256 for Scalar {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_join() {
+        assert_eq!(join(0, 0), 0);
+        assert_eq!(join(1, 0), 1);
+        assert_eq!(join(0, 1), 0x20000000);
+        assert_eq!(join(0x12345678, 0x1abcdef0), 0x03579bde12345678);
+        assert_eq!(join(LIMB_MASK, LIMB_MASK), 0x03ffffffffffffff);
+    }
+
+    #[test]
+    fn test_split() {
+        assert_eq!(split(0), (0, 0));
+        assert_eq!(split(1), (1, 0));
+        assert_eq!(split(0x1fffffff), (LIMB_MASK, 0));
+        assert_eq!(split(0x20000000), (0, 1));
+        assert_eq!(split(0x20000005), (5, 1));
+        assert_eq!(split(0xfffffff000000040), (0x40, 0x7ffffff80));
+    }
+
+    #[test]
+    fn test_low_limb() {
+        assert_eq!(low_limb(0), 0);
+        assert_eq!(low_limb(0x20000000), 0);
+        assert_eq!(low_limb(0x03579bde12345678), 0x12345678);
+        assert_eq!(low_limb(0x03ffffffffffffff), LIMB_MASK);
+        assert_eq!(low_limb(u64::MAX), LIMB_MASK);
+    }
+
+    #[test]
+    fn test_high_limb() {
+        assert_eq!(high_limb(0), 0);
+        assert_eq!(high_limb(0x1fffffff), 0);
+        assert_eq!(high_limb(0x20000000), 1);
+        assert_eq!(high_limb(0x03579bde12345678), 0x1abcdef0);
+        assert_eq!(high_limb(0x03ffffffffffffff), LIMB_MASK);
+        assert_eq!(high_limb(u64::MAX), LIMB_MASK);
+    }
+
+    #[test]
+    fn test_mac() {
+        assert_eq!(mac(0, 0, 0), 0);
+        assert_eq!(mac(10, 0, 3), 10);
+        assert_eq!(mac(0, 2, 3), 6);
+        assert_eq!(mac(10, 2, 3), 16);
+        assert_eq!(mac(10, LIMB_MASK, LIMB_MASK), 0x03ffffffc000000b);
+    }
+
+    #[test]
+    fn test_mac_headroom() {
+        assert_eq!(
+            mac(0xfbfffff04000003f, LIMB_MASK, LIMB_MASK),
+            0xfffffff000000040
+        );
+    }
 
     #[test]
     fn test_from_const() {
@@ -999,6 +1459,248 @@ mod tests {
         assert_ne!(modulus >> ((Scalar::LEN - 1) * 8), U256::zero());
         assert_eq!(modulus >> Scalar::NUM_BITS, U256::zero());
         assert_ne!(modulus >> (Scalar::NUM_BITS - 1), U256::zero());
+    }
+
+    #[test]
+    fn test_p() {
+        assert_eq!(Scalar::from_u64s(MODULUS), Scalar::P);
+    }
+
+    #[test]
+    fn test_from_u64s() {
+        assert_eq!(
+            Scalar::from_u64s([0, 0, 0, 0]),
+            Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            Scalar::from_u64s([1, 0, 0, 0]),
+            Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            Scalar::from_u64s([
+                0x8796a5b4c3d2e1f0,
+                0x0f1e2d3c4b5a6978,
+                0xfedcba9876543210,
+                0x0123456789abcdef,
+            ]),
+            Scalar(
+                0x03d2e1f0, 0x1cb52da6, 0x169a5e21, 0x1c5a7896, 0x032100f1, 0x1d4c3b2a, 0x17bffb72,
+                0x0cf13579, 0x00012345,
+            )
+        );
+        assert_eq!(
+            Scalar::from_u64s([
+                0x4000000000000001,
+                0xfffffffffffffffe,
+                0xffffffffffffffff,
+                0x7fffffffffffffff,
+            ]),
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff,
+            )
+        );
+        assert_eq!(
+            Scalar::from_u64s([u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+            Scalar(
+                0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x00ffffff,
+            )
+        );
+    }
+
+    #[test]
+    fn test_to_u64s() {
+        assert_eq!(Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0).to_u64s(), [0, 0, 0, 0]);
+        assert_eq!(Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0).to_u64s(), [1, 0, 0, 0]);
+        assert_eq!(
+            Scalar(
+                0x03d2e1f0, 0x1cb52da6, 0x169a5e21, 0x1c5a7896, 0x032100f1, 0x1d4c3b2a, 0x17bffb72,
+                0x0cf13579, 0x00012345,
+            )
+            .to_u64s(),
+            [
+                0x8796a5b4c3d2e1f0,
+                0x0f1e2d3c4b5a6978,
+                0xfedcba9876543210,
+                0x0123456789abcdef,
+            ]
+        );
+        assert_eq!(
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff,
+            )
+            .to_u64s(),
+            [
+                0x4000000000000001,
+                0xfffffffffffffffe,
+                0xffffffffffffffff,
+                0x7fffffffffffffff,
+            ]
+        );
+        assert_eq!(
+            Scalar(
+                0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x00ffffff,
+            )
+            .to_u64s(),
+            [u64::MAX, u64::MAX, u64::MAX, u64::MAX]
+        );
+    }
+
+    #[test]
+    fn test_to_u64s_discards_high_bits() {
+        assert_eq!(
+            Scalar(LIMB_MASK, 0, 0, 0, 0, 0, 0, 0, LIMB_MASK).to_u64s(),
+            [0x000000001fffffff, 0, 0, 0xffffff0000000000]
+        );
+    }
+
+    #[test]
+    fn test_add_limbs() {
+        assert_eq!(
+            Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0).add_limbs(&Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0).add_limbs(&Scalar(2, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(3, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(LIMB_MASK, 0, 0, 0, 0, 0, 0, 0, 0).add_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(0, 1, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(LIMB_MASK, LIMB_MASK, 0, 0, 0, 0, 0, 0, 0)
+                .add_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(0, 0, 1, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(
+                LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                LIMB_MASK, LIMB_MASK
+            )
+            .add_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0), 1)
+        );
+        assert_eq!(
+            Scalar(
+                LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                LIMB_MASK, LIMB_MASK
+            )
+            .add_limbs(&Scalar(
+                LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                LIMB_MASK, LIMB_MASK
+            )),
+            (
+                Scalar(
+                    LIMB_MASK - 1,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK,
+                    LIMB_MASK
+                ),
+                1
+            )
+        );
+    }
+
+    #[test]
+    fn test_add_limbs_modulus() {
+        assert_eq!(
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff
+            )
+            .add_limbs(&Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff
+            )),
+            (
+                Scalar(
+                    0x00000002, 0x00000000, 0x1fffff20, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                    0x1fffffff, 0x1fffffff, 0x00ffffff
+                ),
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn test_sub_limbs() {
+        assert_eq!(
+            Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(3, 0, 0, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(2, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(0, 1, 0, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(LIMB_MASK, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(0, 0, 1, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (Scalar(LIMB_MASK, LIMB_MASK, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+        assert_eq!(
+            Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (
+                Scalar(
+                    LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                    LIMB_MASK, LIMB_MASK
+                ),
+                1
+            )
+        );
+        assert_eq!(
+            Scalar(
+                LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                LIMB_MASK, LIMB_MASK
+            )
+            .sub_limbs(&Scalar(
+                LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK, LIMB_MASK,
+                LIMB_MASK, LIMB_MASK
+            )),
+            (Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0), 0)
+        );
+    }
+
+    #[test]
+    fn test_sub_limbs_modulus() {
+        assert_eq!(
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff
+            )
+            .sub_limbs(&Scalar(1, 0, 0, 0, 0, 0, 0, 0, 0)),
+            (
+                Scalar(
+                    0x00000000, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                    0x1fffffff, 0x1fffffff, 0x007fffff
+                ),
+                0
+            )
+        );
+        assert_eq!(
+            Scalar(0, 0, 0, 0, 0, 0, 0, 0, 0).sub_limbs(&Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff
+            )),
+            (
+                Scalar(
+                    0x1fffffff, 0x1fffffff, 0x0000006f, 0x00000000, 0x00000000, 0x00000000,
+                    0x00000000, 0x00000000, 0x1f800000
+                ),
+                1
+            )
+        );
     }
 
     #[test]
@@ -1268,6 +1970,69 @@ mod tests {
         assert_eq!(bool::from(v0.ct_gt(&v4)), false);
         assert_eq!(bool::from(v1.ct_gt(&v2)), false);
         assert_eq!(bool::from(v3.ct_gt(&v4)), false);
+    }
+
+    #[test]
+    fn test_ct_gt_limb_boundaries() {
+        assert_eq!(
+            bool::from(parse_scalar("0x20000000").ct_gt(&parse_scalar("0x1fffffff"))),
+            true
+        );
+        assert_eq!(
+            bool::from(parse_scalar("0x1fffffff").ct_gt(&parse_scalar("0x20000000"))),
+            false
+        );
+        assert_eq!(
+            bool::from(parse_scalar("0x400000000000000").ct_gt(&parse_scalar("0x3ffffffffffffff"))),
+            true
+        );
+        assert_eq!(
+            bool::from(parse_scalar("0x3ffffffffffffff").ct_gt(&parse_scalar("0x400000000000000"))),
+            false
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0x10000000000000000").ct_gt(&parse_scalar("0xffffffffffffffff"))
+            ),
+            true
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0xffffffffffffffff").ct_gt(&parse_scalar("0x10000000000000000"))
+            ),
+            false
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0x100000000000000000000000000000000")
+                    .ct_gt(&parse_scalar("0xffffffffffffffffffffffffffffffff"))
+            ),
+            true
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0xffffffffffffffffffffffffffffffff")
+                    .ct_gt(&parse_scalar("0x100000000000000000000000000000000"))
+            ),
+            false
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0x10000000000000000000000000000000000000000000000000000000000")
+                    .ct_gt(&parse_scalar(
+                        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    ))
+            ),
+            true
+        );
+        assert_eq!(
+            bool::from(
+                parse_scalar("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").ct_gt(
+                    &parse_scalar("0x10000000000000000000000000000000000000000000000000000000000")
+                )
+            ),
+            false
+        );
     }
 
     #[test]
@@ -1550,6 +2315,59 @@ mod tests {
             parse_scalar("0x233f7c593e331b2e1285f17013cd4b692d7219c10bf06adca229780913851577"),
             parse_scalar("0x4433ff6315d939cda16f055756432036cab445af8186bc60b243127905b84c73"),
             parse_scalar("0x9c067acc5750877bb19fea85a6c3088c3bb0b10cb0eb34d3bf843f7038de993"),
+        );
+    }
+
+    #[test]
+    fn test_mul_max() {
+        assert_eq!(Scalar::MAX * Scalar::MAX, Scalar::ONE);
+        assert_eq!(Scalar::MAX.square(), Scalar::ONE);
+        assert_eq!(Scalar::MAX * Scalar::MINUS_TWO, from_const(2));
+        assert_eq!(Scalar::MINUS_TWO * Scalar::MINUS_TWO, from_const(4));
+    }
+
+    #[test]
+    fn test_mont_mul_largest_limbs() {
+        // The largest limbs a canonical value can have: all ones except for the top one.
+        let value = Scalar(
+            0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+            0x1fffffff, 0x007ffffe,
+        );
+        assert_eq!(
+            Scalar::mont_mul(&value, &value),
+            Scalar(
+                0x00000001, 0x1a7000e0, 0x1fffffa9, 0x1fffffff, 0x1fffff3b, 0x1fffffff, 0x1fffaa3f,
+                0x1e000000, 0x00627bff,
+            )
+        );
+        assert_eq!(
+            Scalar::mont_mul(&value, &Scalar::MAX_RAW),
+            Scalar(
+                0x00000001, 0x12700070, 0x1fffffab, 0x1fffffff, 0x1fffff3b, 0x1fffffff, 0x1fffaa3f,
+                0x1f7fffff, 0x005e7bff,
+            )
+        );
+    }
+
+    #[test]
+    fn test_modp() {
+        assert_eq!(Scalar::ZERO.modp(), Scalar::ZERO);
+        assert_eq!(Scalar::MAX_RAW.modp(), Scalar::MAX_RAW);
+        assert_eq!(
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff90, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x007fffff,
+            )
+            .modp(),
+            Scalar::ZERO
+        );
+        assert_eq!(
+            Scalar(
+                0x00000001, 0x00000000, 0x1fffff20, 0x1fffffff, 0x1fffffff, 0x1fffffff, 0x1fffffff,
+                0x1fffffff, 0x00ffffff,
+            )
+            .modp(),
+            Scalar::MAX_RAW
         );
     }
 
